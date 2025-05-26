@@ -1,0 +1,18 @@
+{
+  "training_date": "2025-05-24T23:20:28.897403",
+  "training_dir": "./training",
+  "epochs": 10,
+  "batch_size": 8,
+  "num_samples": 220,
+  "class_mapping": {
+    "attacks": 0,
+    "goals": 1,
+    "no_events": 2
+  },
+  "input_shape": [
+    10,
+    224,
+    224,
+    3
+  ]
+}

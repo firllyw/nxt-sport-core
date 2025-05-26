@@ -1,0 +1,141 @@
+<!-- upload_form.html -->
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Upload Soccer Video</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 600px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        .form-group {
+            margin-bottom: 15px;
+        }
+        label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: bold;
+        }
+        input, button {
+            padding: 8px;
+            width: 100%;
+        }
+        button {
+            background-color: #4CAF50;
+            color: white;
+            border: none;
+            cursor: pointer;
+            margin-top: 10px;
+        }
+        button:hover {
+            background-color: #45a049;
+        }
+    </style>
+</head>
+<body>
+    <h1>Upload Soccer Video</h1>
+    
+    <form action="http://localhost:5000/api/upload-and-extract" method="post" enctype="multipart/form-data">
+        <div class="form-group">
+            <label for="video">Select Video File:</label>
+            <input type="file" id="video" name="video" accept=".mp4,.avi,.mov,.mkv" required>
+        </div>
+        
+        <div class="form-group">
+            <label for="event_name">Event Name:</label>
+            <input type="text" id="event_name" name="event_name" placeholder="e.g. White vs Red Match" required>
+        </div>
+        
+        <div class="form-group">
+            <label for="event_date">Event Date:</label>
+            <input type="date" id="event_date" name="event_date" required>
+        </div>
+        
+        <div class="form-group">
+            <label for="event_time">Event Time:</label>
+            <input type="time" id="event_time" name="event_time" required>
+        </div>
+        
+        <div class="form-group">
+            <label for="event_place">Event Location:</label>
+            <input type="text" id="event_place" name="event_place" placeholder="e.g. Soccer Field A" required>
+        </div>
+        
+        <button type="submit">Upload & Process Video</button>
+    </form>
+    
+    <div id="status" style="margin-top: 20px;"></div>
+    
+    <script>
+        document.querySelector('form').addEventListener('submit', function(e) {
+            e.preventDefault();
+            
+            const formData = new FormData(this);
+            const statusDiv = document.getElementById('status');
+            
+            statusDiv.innerHTML = '<p>Uploading video, please wait...</p>';
+            
+            fetch(this.action, {
+                method: 'POST',
+                body: formData
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.status === 'success') {
+                    statusDiv.innerHTML = `
+                        <p>Video uploaded successfully!</p>
+                        <p>Video ID: ${data.video_id}</p>
+                        <p>Processing has begun in the background. Check status at: 
+                           <a href="http://localhost:5000/api/processing-status/${data.video_id}" target="_blank">
+                             Processing Status
+                           </a>
+                        </p>
+                    `;
+                    
+                    // Start polling for status
+                    pollProcessingStatus(data.video_id);
+                } else {
+                    statusDiv.innerHTML = `<p>Error: ${data.error}</p>`;
+                }
+            })
+            .catch(error => {
+                statusDiv.innerHTML = `<p>Error: ${error.message}</p>`;
+            });
+        });
+        
+        function pollProcessingStatus(videoId) {
+            const statusDiv = document.getElementById('status');
+            const statusUrl = `http://localhost:5000/api/processing-status/${videoId}`;
+            
+            const checkStatus = () => {
+                fetch(statusUrl)
+                    .then(response => response.json())
+                    .then(data => {
+                        if (data.processing_status === 'completed') {
+                            statusDiv.innerHTML += `
+                                <p>Processing completed! You can now view the video analysis.</p>
+                                <p><a href="/videos/${videoId}" target="_blank">View Video Analysis</a></p>
+                            `;
+                        } else if (data.processing_status === 'failed') {
+                            statusDiv.innerHTML += `
+                                <p>Processing failed: ${data.processing_error || 'Unknown error'}</p>
+                            `;
+                        } else {
+                            // Still processing, check again in 5 seconds
+                            statusDiv.innerHTML += `<p>Processing status: ${data.processing_status}...</p>`;
+                            setTimeout(checkStatus, 5000);
+                        }
+                    })
+                    .catch(error => {
+                        statusDiv.innerHTML += `<p>Error checking status: ${error.message}</p>`;
+                    });
+            };
+            
+            // Start checking status
+            setTimeout(checkStatus, 2000);
+        }
+    </script>
+</body>
+</html>

@@ -1,0 +1,4 @@
+training/*
+video/*
+temp_downloads/*
+__pycache__/
