@@ -1,148 +1,127 @@
 import os
+import json
 import numpy as np
 import tensorflow as tf
 from tensorflow.keras import layers, models, applications
 import cv2
 
 class SoccerEventDetector:
-    def __init__(self, model_path=None):
+    def __init__(self, model_path="models/soccer_events_model", for_training=False, num_classes=3):
         """
-        Initialize the Soccer Event Detector
-        
-        Args:
-            model_path (str): Path to the saved model, if None, will create a new model
+        Initialize the Soccer Event Detector.
+        If for_training is True, creates a trainable Keras model.
+        Otherwise loads TensorFlow SavedModel for fast production inference.
         """
-    # Default classes - will be updated if a model with metadata is loaded
-        self.classes = ['No Event', 'Goal', 'Attack']
+        self.class_map = {
+            0: "Attack",
+            1: "Goal",
+            2: "No Event"
+        }
+        self.classes = ['attacks', 'goals', 'no_events']
         self.input_shape = (224, 224, 3)
         self.sequence_length = 10
-        
+        self.infer = None
+        self.model = None
+        self.model_path = model_path
+
+        if for_training:
+            self.model = self._build_model(num_classes=num_classes)
+            print(f"[SoccerEventDetector] Trainable Keras model built for {num_classes} classes.")
+            return
+
         if model_path and os.path.exists(model_path):
-            # First check if we have metadata
             metadata_path = os.path.join(model_path, "metadata.json")
             if os.path.exists(metadata_path):
                 try:
                     with open(metadata_path, "r") as f:
-                        metadata = json.load(f)
-                    if "class_mapping" in metadata:
-                        # Update classes from metadata
-                        self.classes = [name for name in sorted(metadata["class_mapping"].keys())]
-                        print(f"Loaded classes from metadata: {self.classes}")
+                        meta = json.load(f)
+                    if "class_mapping" in meta:
+                        raw_map = {idx: name for name, idx in meta["class_mapping"].items()}
+                        name_pretty = {"attacks": "Attack", "goals": "Goal", "no_events": "No Event"}
+                        self.class_map = {idx: name_pretty.get(name, name.capitalize()) for idx, name in raw_map.items()}
+                        self.classes = [name for name in sorted(meta["class_mapping"].keys())]
+                        print(f"[SoccerEventDetector] Loaded class mapping: {self.class_map}")
                 except Exception as e:
-                    print(f"Error loading metadata: {e}")
-            
-            # Load the saved model
-            self.model = tf.keras.models.load_model(model_path)
-            print(f"Model loaded from {model_path}")
-        else:
-            self.model = self._build_model()
-            print("New model created. Training required.")
+                    print(f"[SoccerEventDetector] Error loading metadata: {e}")
 
-    
-    def _build_model(self):
+            print(f"[SoccerEventDetector] Loading TensorFlow SavedModel from {model_path}...")
+            imported = tf.saved_model.load(model_path)
+            self.infer = imported.signatures["serving_default"]
+            print("[SoccerEventDetector] Model loaded successfully for inference.")
+        else:
+            self.model = self._build_model(num_classes=num_classes)
+            print("[SoccerEventDetector] Model path not found. Initialized new trainable model.")
+
+    def _build_model(self, num_classes=3):
         """
-        Build a CNN+LSTM model for video classification
+        Build EfficientNetB0 + LSTM video classification model
         """
-        # Base model - using EfficientNetB0 (lightweight but powerful)
         base_model = applications.EfficientNetB0(
             weights='imagenet',
             include_top=False,
             input_shape=self.input_shape
         )
-        
-        # Freeze the base model
         base_model.trainable = False
-        
-        # Create sequence model
+
         model = models.Sequential([
-            # Time distributed wrapper for processing video frames
-            layers.TimeDistributed(base_model, input_shape=(self.sequence_length, *self.input_shape)),
+            layers.Input(shape=(self.sequence_length, *self.input_shape)),
+            layers.TimeDistributed(base_model),
             layers.TimeDistributed(layers.GlobalAveragePooling2D()),
             layers.TimeDistributed(layers.Dropout(0.3)),
-            
-            # Add recurrent layers to process the sequence
             layers.LSTM(256, return_sequences=True),
             layers.LSTM(128),
             layers.Dense(64, activation='relu'),
             layers.Dropout(0.3),
-            layers.Dense(len(self.classes), activation='softmax')
+            layers.Dense(num_classes, activation='softmax')
         ])
-        
-        # Compile the model
+
         model.compile(
             optimizer=tf.keras.optimizers.Adam(learning_rate=0.0001),
             loss='categorical_crossentropy',
             metrics=['accuracy']
         )
-        
         return model
-    
-    def preprocess_frame(self, frame):
-        """
-        Preprocess a single frame for the model
-        """
-        # Resize to expected input size
-        frame = cv2.resize(frame, (self.input_shape[0], self.input_shape[1]))
-        
-        # Convert to RGB if needed (OpenCV uses BGR)
-        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        
-        # Normalize pixel values
-        frame = frame / 255.0
-        
-        return frame
-    
-    def predict_sequence(self, frames):
-        """
-        Predict the class of a sequence of frames
-        
-        Args:
-            frames: List of frames to predict on
-            
-        Returns:
-            Index of the predicted class
-        """
-        # Ensure we have the right number of frames
-        if len(frames) != self.sequence_length:
-            raise ValueError(f"Expected {self.sequence_length} frames, got {len(frames)}")
-        
-        # Preprocess all frames
-        preprocessed_frames = np.array([self.preprocess_frame(frame) for frame in frames])
-        
-        # Add batch dimension
-        preprocessed_frames = np.expand_dims(preprocessed_frames, axis=0)
-        
-        # Make prediction
-        prediction = self.model.predict(preprocessed_frames, verbose=0)
-        predicted_class_idx = np.argmax(prediction[0])
-        confidence = prediction[0][predicted_class_idx]
-        
-        return predicted_class_idx, confidence
-    
+
     def save_model(self, path):
         """
-        Save the model to disk
+        Save the model in TensorFlow SavedModel format
         """
-        self.model.save(path)
-        print(f"Model saved to {path}")
+        if self.model is None:
+            raise RuntimeError("No trainable Keras model available to save.")
+        os.makedirs(path, exist_ok=True)
+        self.model.export(path)
+        print(f"[SoccerEventDetector] Model exported to {path}")
 
-def download_pretrained_model():
-    """
-    Function to download a pretrained model if available
-    Placeholder for actual download logic
-    """
-    model_dir = "models/soccer_events_model"
-    
-    # In a real application, you would implement logic to download 
-    # a pre-trained model from a cloud storage or similar
-    
-    if not os.path.exists(model_dir):
-        os.makedirs(model_dir, exist_ok=True)
-        print(f"Created directory {model_dir} for model storage")
-        return None
-    
-    # Check if model exists
-    if os.path.exists(f"{model_dir}/saved_model.pb"):
-        return model_dir
-    
-    return None
+    def preprocess_frame(self, frame):
+        """
+        Preprocess a single frame: resize, convert to RGB, normalize 0-1
+        """
+        frame_resized = cv2.resize(frame, (self.input_shape[0], self.input_shape[1]))
+        frame_rgb = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGB)
+        return frame_rgb.astype(np.float32) / 255.0
+
+    def predict_sequence(self, frames):
+        """
+        Predict event class for a sequence of 10 frames
+        """
+        if len(frames) != self.sequence_length:
+            raise ValueError(f"Expected {self.sequence_length} frames, got {len(frames)}")
+
+        processed = np.array([self.preprocess_frame(f) for f in frames], dtype=np.float32)
+
+        if self.infer is not None:
+            batch_input = tf.constant(np.expand_dims(processed, axis=0))
+            outputs = self.infer(batch_input)
+            key = list(outputs.keys())[0]
+            probs = outputs[key].numpy()[0]
+        elif self.model is not None:
+            batch_input = np.expand_dims(processed, axis=0)
+            probs = self.model.predict(batch_input, verbose=0)[0]
+        else:
+            raise RuntimeError("Neither SavedModel infer nor Keras model is loaded.")
+
+        predicted_idx = int(np.argmax(probs))
+        confidence = float(probs[predicted_idx])
+        class_name = self.class_map.get(predicted_idx, "Unknown")
+
+        return predicted_idx, confidence, class_name

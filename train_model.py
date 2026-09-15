@@ -191,16 +191,8 @@ def train_model(training_dir, model_dir, epochs=10, batch_size=8):
         with open(os.path.join(model_dir, "metadata.json"), "w") as f:
             json.dump(metadata, f, indent=2)
         
-        # Check if we already have a trained model to continue training
-        if os.path.exists(os.path.join(model_dir, "saved_model.pb")):
-            print(f"Loading existing model from {model_dir}")
-            detector = SoccerEventDetector(model_dir)
-            print("Continuing training on existing model")
-        else:
-            print("Creating new model")
-            detector = SoccerEventDetector()
-        
-        # Update model classes if needed
+        # Initialize model for training
+        detector = SoccerEventDetector(for_training=True, num_classes=len(class_mapping))
         detector.classes = [class_name for class_name in sorted(class_mapping.keys())]
         
         # Train the model

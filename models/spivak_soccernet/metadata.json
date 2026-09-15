@@ -1,0 +1,29 @@
+{
+  "model_name": "spivak-action-spotting-soccernet",
+  "source": "https://huggingface.co/yahoo-inc/spivak-action-spotting-soccernet",
+  "paper": "Temporally Precise Action Spotting in Soccer Videos Using Dense Detection Anchors (ICIP 2022 / SoccerNet Challenge 2022 Winner)",
+  "architecture": "1D Temporal U-Net (Dense Detection Anchors)",
+  "input_shape": [224, 2048, 1],
+  "input_description": "224 time steps (112 seconds at 2.0 FPS) of 2048-dimensional ResNet-152 visual embeddings",
+  "output_shape": [224, 17, 1],
+  "output_description": "Per-timestep logits for 17 SoccerNet action classes",
+  "classes": {
+    "0": "Penalty",
+    "1": "Kick-off",
+    "2": "Goal",
+    "3": "Substitution",
+    "4": "Offside",
+    "5": "Shots on target",
+    "6": "Shots off target",
+    "7": "Clearance",
+    "8": "Ball out of play",
+    "9": "Throw-in",
+    "10": "Foul",
+    "11": "Indirect free-kick",
+    "12": "Direct free-kick",
+    "13": "Corner",
+    "14": "Yellow card",
+    "15": "Red card",
+    "16": "Yellow->red card"
+  }
+}

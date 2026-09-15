@@ -1,10 +1,13 @@
-import cv2
-import numpy as np
 import os
+import cv2
 import time
+import shutil
 from collections import deque
-from mongo import save_events_to_db
-from ml_model import SoccerEventDetector, download_pretrained_model
+from ml_model import SoccerEventDetector
+from clip_cutter import cut_clip, extract_thumbnail, get_video_info
+from minio_storage import upload_file
+from gdrive_downloader import download_gdrive_video
+from spivak_service import extract_soccer_events_spivak, SpivakSoccerSpotter
 
 EVENT_DETECTOR = None
 
@@ -13,187 +16,220 @@ def initialize_model():
     Initialize the ML model if not already loaded
     """
     global EVENT_DETECTOR
-    
     if EVENT_DETECTOR is None:
-        model_path = "models/soccer_events_model"
-        
-        if os.path.exists(model_path):
-            EVENT_DETECTOR = SoccerEventDetector(model_path)
-        else:
-            print("WARNING: No trained model found. Using fallback detection methods.")
-            EVENT_DETECTOR = SoccerEventDetector()
-    
+        model_path = os.path.join(os.path.dirname(__file__), "models", "soccer_events_model")
+        EVENT_DETECTOR = SoccerEventDetector(model_path)
     return EVENT_DETECTOR
 
-def extract_soccer_events(video_path):
-    """
-    Extract soccer events (Goals and Attacks) from a video file using ML
-    
-    Args:
-        video_path (str): Path to the video file
-        
-    Returns:
-        list: List of event dictionaries with timestamp and event type
-    """
-    # Initialize ML model
-    model = initialize_model()
-    events = []
-    
-    # Open the video file
-    cap = cv2.VideoCapture(video_path)
-    
-    if not cap.isOpened():
-        raise Exception(f"Error opening video file: {video_path}")
-    
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    duration = frame_count / fps
-    
-    # We'll use a sliding window approach to analyze video segments
-    sequence_length = model.sequence_length
-    frame_buffer = deque(maxlen=sequence_length)
-    
-    # Skip frames to speed up processing - analyze every n frames
-    frame_skip = 3  # Analyze every 3rd frame
-    
-    # Cooldown period to avoid detecting the same event multiple times
-    event_cooldown = {"Goal": 0, "Attack": 0}
-    cooldown_frames = {"Goal": int(10 * fps), "Attack": int(5 * fps)}
-    
-    # Process frames
-    frame_idx = 0
-    while frame_idx < frame_count:
-        ret, frame = cap.read()
-        
-        if not ret:
-            break
-        
-        # Process every nth frame to improve performance
-        if frame_idx % frame_skip == 0:
-            frame_buffer.append(frame.copy())
-            
-            # When buffer is full, run prediction
-            if len(frame_buffer) == sequence_length:
-                # Calculate timestamp in seconds
-                timestamp = frame_idx / fps
-                
-                # Run ML prediction
-                predicted_class_idx, confidence = model.predict_sequence(list(frame_buffer))
-                predicted_class = model.classes[predicted_class_idx]
-                
-                # If an event is detected with high confidence
-                if predicted_class != 'No Event' and confidence > 0.71:
-                    # Check cooldown period
-                    if event_cooldown[predicted_class] <= 0:
-                        events.append({
-                            "timestamp": timestamp,
-                            "event_type": predicted_class,
-                            "confidence": float(confidence)
-                        })
-                        
-                        # Set cooldown period
-                        event_cooldown[predicted_class] = cooldown_frames[predicted_class]
-        
-        # Update cooldown counters
-        for event_type in event_cooldown:
-            if event_cooldown[event_type] > 0:
-                event_cooldown[event_type] -= 1
-        
-        frame_idx += 1
-    
-    # Release resources
-    cap.release()
-    
-    # Sort events by timestamp
-    events.sort(key=lambda x: x['timestamp'])
-    
-    # Save events to MongoDB
-    video_filename = os.path.basename(video_path)
-    save_events_to_db(video_filename, events)
-    
-    events.sort(key=lambda x: x['timestamp'])
-
-    # Merge nearby events
-    events = merge_nearby_events(events, time_threshold=3.0)
-    
-    return events
-
-def extract_frames_around_timestamp(video_path, timestamp, window_seconds=5):
-    """
-    Extract frames around a specific timestamp for verification
-    
-    Args:
-        video_path (str): Path to the video file
-        timestamp (float): Timestamp in seconds
-        window_seconds (int): Number of seconds to extract before and after
-        
-    Returns:
-        list: List of paths to extracted frames
-    """
-    cap = cv2.VideoCapture(video_path)
-    
-    if not cap.isOpened():
-        raise Exception(f"Error opening video file: {video_path}")
-    
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    
-    # Calculate start and end frames
-    start_frame = max(0, int((timestamp - window_seconds) * fps))
-    end_frame = int((timestamp + window_seconds) * fps)
-    
-    # Create output directory
-    video_filename = os.path.basename(video_path).split('.')[0]
-    output_dir = f"./static/frames/{video_filename}/{int(timestamp)}"
-    os.makedirs(output_dir, exist_ok=True)
-    
-    frame_paths = []
-    
-    # Set frame position to start frame
-    cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
-    
-    current_frame = start_frame
-    while current_frame <= end_frame:
-        ret, frame = cap.read()
-        
-        if not ret:
-            break
-        
-        # Save every 5th frame to reduce number of images
-        if current_frame % 5 == 0:
-            frame_path = f"{output_dir}/frame_{current_frame}.jpg"
-            cv2.imwrite(frame_path, frame)
-            frame_paths.append(frame_path)
-        
-        current_frame += 1
-    
-    cap.release()
-    
-    return frame_paths
-
-# Add this function to service.py
-def merge_nearby_events(events, time_threshold=3.0):
+def merge_nearby_events(events, time_threshold=4.0):
     """
     Merge events of the same type that occur within a specified time threshold
     """
     if not events:
         return []
         
-    # Sort events by timestamp
     sorted_events = sorted(events, key=lambda x: x['timestamp'])
-    
-    merged_events = [sorted_events[0]]
+    merged = [sorted_events[0]]
     
     for event in sorted_events[1:]:
-        last_event = merged_events[-1]
+        last_event = merged[-1]
         
-        # If same event type and close in time, merge by keeping the one with higher confidence
+        # If same event type and close in time, keep the one with higher confidence
         if (event['event_type'] == last_event['event_type'] and 
             abs(event['timestamp'] - last_event['timestamp']) <= time_threshold):
-            
-            # Keep the event with higher confidence
             if event['confidence'] > last_event['confidence']:
-                merged_events[-1] = event
+                merged[-1] = event
         else:
-            merged_events.append(event)
+            merged.append(event)
             
-    return merged_events
+    return merged
+
+def extract_soccer_events(video_path, min_confidence=0.65, frame_skip=3, progress_callback=None):
+    """
+    Extract soccer events (Goal and Attack) using ML sliding window
+    """
+    model = initialize_model()
+    events = []
+    
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise RuntimeError(f"Gagal membuka file video: {video_path}")
+        
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    duration = frame_count / fps if fps > 0 else 0.0
+    
+    sequence_length = model.sequence_length
+    frame_buffer = deque(maxlen=sequence_length)
+    
+    cooldown_frames = {"Goal": int(10 * fps), "Attack": int(5 * fps)}
+    event_cooldown = {"Goal": 0, "Attack": 0}
+    
+    frame_idx = 0
+    last_reported_pct = 0
+    
+    while frame_idx < frame_count:
+        ret, frame = cap.read()
+        if not ret:
+            break
+            
+        if frame_idx % frame_skip == 0:
+            frame_buffer.append(frame.copy())
+            
+            if len(frame_buffer) == sequence_length:
+                timestamp = frame_idx / fps
+                pred_idx, confidence, class_name = model.predict_sequence(list(frame_buffer))
+                
+                if class_name in ['Goal', 'Attack'] and confidence >= min_confidence:
+                    if event_cooldown[class_name] <= 0:
+                        events.append({
+                            "timestamp": round(timestamp, 2),
+                            "minute": int(timestamp // 60),
+                            "event_type": class_name.upper(),
+                            "confidence": round(confidence, 3)
+                        })
+                        event_cooldown[class_name] = cooldown_frames[class_name]
+                        
+        for k in event_cooldown:
+            if event_cooldown[k] > 0:
+                event_cooldown[k] -= 1
+                
+        # Report progress periodically
+        if frame_idx % (frame_skip * 30) == 0 and progress_callback and frame_count > 0:
+            pct = int((frame_idx / frame_count) * 100)
+            if pct > last_reported_pct:
+                last_reported_pct = pct
+                progress_callback(pct, f"Menganalisis frame video... ({pct}%)")
+                
+        frame_idx += 1
+        
+    cap.release()
+    
+    # Merge nearby events
+    events = merge_nearby_events(events, time_threshold=4.0)
+    return events, duration
+
+def process_match_video_pipeline(job_id, gdrive_url_or_path, event_id, match_id="general", options=None, progress_callback=None):
+    """
+    Full pipeline:
+    1. Download GDrive video
+    2. Extract events
+    3. Cut clips & extract thumbnails
+    4. Upload to MinIO
+    5. Cleanup local scratch files
+    """
+    options = options or {}
+    engine = options.get("engine", "spivak").lower()
+    default_conf = 0.25 if engine == "spivak" else 0.65
+    min_confidence = float(options.get("min_confidence", default_conf))
+    clip_padding_before = float(options.get("clip_padding_before", 6.0))
+    clip_padding_after = float(options.get("clip_padding_after", 6.0))
+    clip_duration = clip_padding_before + clip_padding_after
+    
+    scratch_dir = os.path.join(os.path.dirname(__file__), "scratch", job_id)
+    os.makedirs(scratch_dir, exist_ok=True)
+    
+    raw_video_path = None
+    try:
+        # Step 1: Download or locate video
+        if os.path.exists(gdrive_url_or_path):
+            raw_video_path = gdrive_url_or_path
+        else:
+            raw_video_path = os.path.join(scratch_dir, "raw_video.mp4")
+            if progress_callback:
+                progress_callback("DOWNLOADING", 5, "Memulai unduhan video dari Google Drive...")
+                
+            def dl_hook(pct, msg):
+                if progress_callback:
+                    progress_callback("DOWNLOADING", pct, msg)
+                    
+            download_gdrive_video(gdrive_url_or_path, raw_video_path, progress_callback=dl_hook)
+            
+        # Step 2: AI Event Analysis
+        if progress_callback:
+            engine_name = "Spivak SoccerNet" if engine == "spivak" else "Native EfficientNet+LSTM"
+            progress_callback("ANALYZING", 0, f"Memulai analisis visual AI ({engine_name})...")
+            
+        def ai_hook(pct, msg):
+            if progress_callback:
+                progress_callback("ANALYZING", pct, msg)
+                
+        if engine == "spivak":
+            events, duration = extract_soccer_events_spivak(
+                raw_video_path,
+                min_confidence=min_confidence,
+                progress_callback=ai_hook
+            )
+        else:
+            events, duration = extract_soccer_events(
+                raw_video_path,
+                min_confidence=min_confidence,
+                frame_skip=3,
+                progress_callback=ai_hook
+            )
+        
+        print(f"[{job_id}] [{engine}] Found {len(events)} events in video duration {duration:.1f}s (min_confidence={min_confidence})", flush=True)
+        if len(events) == 0:
+            print(f"[{job_id}] [{engine}] Notice: 0 events detected with threshold {min_confidence}. Try lowering threshold or switching engine.", flush=True)
+        
+        # Step 3: Cut clips & Upload to MinIO
+        if progress_callback:
+            progress_callback("UPLOADING", 0, f"Memotong {len(events)} klip highlight dan mengunggah ke MinIO...")
+            
+        highlights = []
+        clean_match_id = match_id or "general"
+        clean_event_id = event_id or "general"
+        
+        for idx, ev in enumerate(events):
+            ts = ev["timestamp"]
+            ev_type = ev["event_type"].lower()
+            start_time = max(0.0, ts - clip_padding_before)
+            
+            local_clip = os.path.join(scratch_dir, f"clip_{int(ts)}_{ev_type}.mp4")
+            local_thumb = os.path.join(scratch_dir, f"thumb_{int(ts)}.jpg")
+            
+            # Cut clip
+            cut_clip(raw_video_path, start_time, clip_duration, local_clip)
+            
+            # Extract thumb
+            extract_thumbnail(raw_video_path, ts, local_thumb)
+            
+            # MinIO paths
+            minio_clip_key = f"highlights/{clean_event_id}/{clean_match_id}/clip_{int(ts)}_{ev_type}.mp4"
+            minio_thumb_key = f"highlights/{clean_event_id}/{clean_match_id}/thumb_{int(ts)}.jpg"
+            
+            # Upload
+            upload_file(local_clip, minio_clip_key, content_type="video/mp4")
+            upload_file(local_thumb, minio_thumb_key, content_type="image/jpeg")
+            
+            highlights.append({
+                "timestamp": ts,
+                "minute": ev["minute"],
+                "event_type": ev["event_type"],
+                "confidence": ev["confidence"],
+                "minio_clip_path": minio_clip_key,
+                "minio_thumb_path": minio_thumb_key,
+                "clip_duration": clip_duration
+            })
+            
+            if progress_callback:
+                pct = int(((idx + 1) / max(1, len(events))) * 100)
+                progress_callback("UPLOADING", pct, f"Mengunggah highlight {idx + 1}/{len(events)} ke MinIO...")
+
+        return {
+            "duration": duration,
+            "highlights": highlights
+        }
+        
+    finally:
+        # Step 4: Cleanup scratch folder to save disk
+        try:
+            if os.path.exists(scratch_dir):
+                shutil.rmtree(scratch_dir, ignore_errors=True)
+            if raw_video_path and os.path.exists(raw_video_path) and "scratch" in os.path.abspath(raw_video_path):
+                os.remove(raw_video_path)
+                parent = os.path.dirname(raw_video_path)
+                if os.path.exists(parent) and "uploads" in parent and not os.listdir(parent):
+                    os.rmdir(parent)
+        except Exception as e:
+            print(f"[{job_id}] Warning: cleanup failed for {scratch_dir}: {e}")
