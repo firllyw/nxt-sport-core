@@ -60,6 +60,68 @@ def cut_clip(input_video, start_time, duration, output_path):
     
     return output_path
 
+def slice_candidate_clip(video_path, timestamp, clip_path, audio_path, half_duration=5.0):
+    """
+    Slice a centered 10s verification clip from video at the given timestamp.
+    Also extracts the audio track as a mono WAV file for whistle detection.
+
+    The clip is centered exactly on the Spivak proposal timestamp:
+        [timestamp - half_duration, timestamp + half_duration]
+
+    This is a TEMPORARY clip used only for audio verification — it should be
+    deleted by the caller immediately after verify_event() returns.
+
+    Args:
+        video_path:    Path to the source MP4 video.
+        timestamp:     Event timestamp in seconds (Spivak anchor point).
+        clip_path:     Output path for the 10s MP4 clip.
+        audio_path:    Output path for the extracted WAV audio.
+        half_duration: Seconds before and after the anchor (default 5.0 → 10s total).
+
+    Returns:
+        (clip_path, audio_path_or_None):
+            audio_path is None if the video has no audio stream or extraction fails.
+    """
+    ts = max(0.0, float(timestamp))
+    start = max(0.0, ts - half_duration)
+    duration = half_duration * 2  # 10 seconds total
+
+    os.makedirs(os.path.dirname(clip_path) if os.path.dirname(clip_path) else ".", exist_ok=True)
+
+    # Cut video clip — ultrafast preset since quality doesn't matter for verification
+    cmd_clip = [
+        FFMPEG_EXE, "-y",
+        "-ss", f"{start:.3f}",
+        "-i", video_path,
+        "-t", f"{duration:.3f}",
+        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "32",
+        "-pix_fmt", "yuv420p",
+        "-an",          # no audio in the clip — we extract it separately below
+        clip_path
+    ]
+    result = subprocess.run(cmd_clip, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if result.returncode != 0 or not os.path.exists(clip_path):
+        raise RuntimeError(f"FFmpeg error slicing candidate clip: {result.stderr.decode()[-400:]}")
+
+    # Extract audio as mono 22050 Hz WAV — compatible with librosa
+    cmd_audio = [
+        FFMPEG_EXE, "-y",
+        "-ss", f"{start:.3f}",
+        "-i", video_path,
+        "-t", f"{duration:.3f}",
+        "-vn",                      # no video
+        "-acodec", "pcm_s16le",     # uncompressed PCM
+        "-ar", "22050",             # sample rate matching librosa default
+        "-ac", "1",                 # mono
+        audio_path
+    ]
+    result_audio = subprocess.run(cmd_audio, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if result_audio.returncode != 0 or not os.path.exists(audio_path) or os.path.getsize(audio_path) < 1024:
+        # Video may not have an audio stream — that's OK, verifier handles None gracefully
+        return clip_path, None
+
+    return clip_path, audio_path
+
 def extract_thumbnail(input_video, timestamp, output_path):
     """
     Extract a single JPEG frame at the given timestamp for preview.

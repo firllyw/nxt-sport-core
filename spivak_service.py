@@ -55,8 +55,15 @@ class SpivakSoccerSpotter:
         self.chunk_size = 224  # 224 steps = 112 seconds
         self.feature_dim = 2048
 
-        print(f"[Spivak] Initializing feature extractor (ResNet-152)...")
-        self.resnet = ResNet152(weights='imagenet', include_top=False, pooling='avg')
+        print(f"[Spivak] Initializing feature extractor (domain-adapted ResNet-152)...")
+        try:
+            from feature_extractor import DomainAdaptedExtractor
+            self._extractor = DomainAdaptedExtractor()
+            self.resnet = self._extractor.resnet  # keep self.resnet for normalizer compat
+        except ImportError:
+            print("[Spivak] feature_extractor module not found — using raw ResNet-152.", flush=True)
+            self._extractor = None
+            self.resnet = ResNet152(weights='imagenet', include_top=False, pooling='avg')
 
         print(f"[Spivak] Loading normalizer from {model_dir}...")
         normalizer_path = os.path.join(model_dir, "resnet_normalizer.pkl")
@@ -234,14 +241,14 @@ class SpivakSoccerSpotter:
         radius_steps = int(6.0 * self.fps)  # 6 seconds correlation window
 
         # 1. Spot Goal candidates
-        goal_peak_indices = np.where(goal_probs >= 0.075)[0]
+        goal_peak_indices = np.where(goal_probs >= 0.15)[0]
         for idx in goal_peak_indices:
             g_conf = float(goal_probs[idx])
             start_w = max(0, idx - radius_steps)
             end_w = min(num_timesteps, idx + radius_steps + 1)
             max_shot_nearby = float(np.max(shot_on_probs[start_w:end_w])) if end_w > start_w else 0.0
             
-            is_valid_goal = (g_conf >= 0.12) or (g_conf >= 0.075 and max_shot_nearby >= 0.15)
+            is_valid_goal = (g_conf >= 0.20) or (g_conf >= 0.15 and max_shot_nearby >= 0.20)
             if is_valid_goal:
                 # Combined confidence reflecting both the shot and goal signal
                 combined_conf = round(max(g_conf, max_shot_nearby * 0.9), 3)
@@ -255,7 +262,7 @@ class SpivakSoccerSpotter:
                 })
 
         # 2. Spot Penalty candidates
-        penalty_indices = np.where(penalty_probs >= 0.18)[0]
+        penalty_indices = np.where(penalty_probs >= 0.22)[0]
         for idx in penalty_indices:
             candidates.append({
                 "timestep": idx,
@@ -267,7 +274,7 @@ class SpivakSoccerSpotter:
             })
 
         # 3. Spot Dangerous Attacks / Shots on target
-        shot_on_indices = np.where(shot_on_probs >= 0.18)[0]
+        shot_on_indices = np.where(shot_on_probs >= 0.22)[0]
         for idx in shot_on_indices:
             candidates.append({
                 "timestep": idx,
@@ -279,7 +286,7 @@ class SpivakSoccerSpotter:
             })
 
         # 4. Spot Close Misses / Shots off target
-        shot_off_indices = np.where(shot_off_probs >= 0.24)[0]
+        shot_off_indices = np.where(shot_off_probs >= 0.28)[0]
         for idx in shot_off_indices:
             candidates.append({
                 "timestep": idx,
@@ -291,7 +298,7 @@ class SpivakSoccerSpotter:
             })
 
         # 5. Spot Cards (Yellow / Red)
-        card_indices = np.where((yellow_probs >= 0.18) | (red_probs >= 0.18))[0]
+        card_indices = np.where((yellow_probs >= 0.22) | (red_probs >= 0.22))[0]
         for idx in card_indices:
             is_red = red_probs[idx] >= yellow_probs[idx]
             conf = float(red_probs[idx] if is_red else yellow_probs[idx])
@@ -313,30 +320,45 @@ class SpivakSoccerSpotter:
         # 2) Confidence descending
         candidates = sorted(candidates, key=lambda x: (x["priority"], x["confidence"]), reverse=True)
 
-        # Non-Maximum Suppression with 15-second cooldown to merge replays into single clean highlight clips
-        cooldown_steps = int(15.0 * self.fps)  # 15 seconds cooldown
-        suppressed = np.zeros(num_timesteps, dtype=bool)
+        # Per-class Non-Maximum Suppression.
+        #
+        # Each class tracks its own last-accepted timestamp independently.
+        # Events of DIFFERENT classes within the cooldown window are NOT suppressed
+        # against each other — e.g. a foul (ATTACK) immediately followed by a yellow
+        # card (CARD) correctly produces two separate highlight events.
+        #
+        # Cooldown values:
+        #   GOAL/PENALTY: 20s — long window to de-duplicate broadcast replays
+        #   CARD:         15s — referee usually shows the card once
+        #   ATTACK:        8s — clustered shots should still be deduplicated
+        CLASS_COOLDOWNS_STEPS = {
+            "GOAL":    int(20.0 * self.fps),
+            "PENALTY": int(20.0 * self.fps),
+            "ATTACK":  int(8.0 * self.fps),
+            "CARD":    int(15.0 * self.fps),
+        }
+        last_accepted_step = {k: -99999 for k in CLASS_COOLDOWNS_STEPS}
         selected_events = []
 
         for cand in candidates:
             idx = cand["timestep"]
-            if suppressed[idx]:
+            etype = cand["event_type"]
+            cooldown = CLASS_COOLDOWNS_STEPS.get(etype, int(15.0 * self.fps))
+
+            # Skip if too close to last accepted event of the SAME class
+            if idx - last_accepted_step[etype] < cooldown:
                 continue
 
+            last_accepted_step[etype] = idx
             timestamp = idx / self.fps
             selected_events.append({
                 "timestamp": round(timestamp, 2),
                 "minute": int(timestamp // 60),
-                "event_type": cand["event_type"],
+                "event_type": etype,
                 "confidence": cand["confidence"],
                 "raw_class": cand["raw_class"],
                 "raw_class_id": cand["raw_class_id"]
             })
-
-            # Suppress window around this event
-            start_supp = max(0, idx - cooldown_steps)
-            end_supp = min(num_timesteps, idx + cooldown_steps + 1)
-            suppressed[start_supp:end_supp] = True
 
         # Sort final events chronologically
         selected_events = sorted(selected_events, key=lambda x: x["timestamp"])

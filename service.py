@@ -4,10 +4,23 @@ import time
 import shutil
 from collections import deque
 from ml_model import SoccerEventDetector
-from clip_cutter import cut_clip, extract_thumbnail, get_video_info
+from clip_cutter import cut_clip, extract_thumbnail, get_video_info, slice_candidate_clip
 from minio_storage import upload_file
 from gdrive_downloader import download_gdrive_video
 from spivak_service import extract_soccer_events_spivak, SpivakSoccerSpotter
+
+try:
+    from verifier import verify_event as _verify_event
+    _VERIFIER_AVAILABLE = True
+except ImportError:
+    _VERIFIER_AVAILABLE = False
+    print("[service] Warning: verifier module unavailable — install librosa/scipy to enable whistle verification.")
+
+def verify_event(audio_wav_path, event_type, spivak_confidence, mode="full"):
+    """Thin wrapper — falls back to accepting all events if verifier deps not installed."""
+    if not _VERIFIER_AVAILABLE or mode == "disabled":
+        return True
+    return _verify_event(audio_wav_path, event_type, spivak_confidence, mode)
 
 EVENT_DETECTOR = None
 
@@ -172,7 +185,51 @@ def process_match_video_pipeline(job_id, gdrive_url_or_path, event_id, match_id=
         if len(events) == 0:
             print(f"[{job_id}] [{engine}] Notice: 0 events detected with threshold {min_confidence}. Try lowering threshold or switching engine.", flush=True)
         
-        # Step 3: Cut clips & Upload to MinIO
+        # Step 2b: Verify Spivak candidates via secondary audio signal (whistle)
+        # Native engine events skip this step — they use a different confidence model.
+        verification_mode = options.get("verification", "full")
+        if engine == "spivak" and verification_mode != "disabled" and len(events) > 0:
+            if progress_callback:
+                progress_callback("ANALYZING", 97, f"Memverifikasi {len(events)} kandidat momen...")
+            
+            verified_events = []
+            for ev in events:
+                ts = ev["timestamp"]
+                cand_clip = os.path.join(scratch_dir, f"cand_{int(ts)}.mp4")
+                cand_audio = os.path.join(scratch_dir, f"cand_{int(ts)}.wav")
+                actual_audio = None
+                
+                try:
+                    _, actual_audio = slice_candidate_clip(
+                        raw_video_path, ts, cand_clip, cand_audio
+                    )
+                except Exception as slice_err:
+                    print(f"[{job_id}] Warning: candidate clip slice failed at {ts}s: {slice_err}", flush=True)
+                
+                accepted = verify_event(
+                    audio_wav_path=actual_audio,
+                    event_type=ev["event_type"],
+                    spivak_confidence=ev["confidence"],
+                    mode=verification_mode
+                )
+                
+                # Always clean up temp files immediately to preserve disk space
+                for tmp in [cand_clip, cand_audio]:
+                    if tmp and os.path.exists(tmp):
+                        try:
+                            os.remove(tmp)
+                        except Exception:
+                            pass
+                
+                if accepted:
+                    verified_events.append(ev)
+                else:
+                    print(f"[{job_id}] Rejected by verifier: {ev['event_type']} at {ts}s conf={ev['confidence']}", flush=True)
+            
+            print(f"[{job_id}] Verification: {len(events)} candidates → {len(verified_events)} accepted", flush=True)
+            events = verified_events
+        
+        # Step 3: Cut final highlight clips & Upload to MinIO
         if progress_callback:
             progress_callback("UPLOADING", 0, f"Memotong {len(events)} klip highlight dan mengunggah ke MinIO...")
             
